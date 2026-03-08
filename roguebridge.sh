@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Requisitos: bash, iproute2, iptables, hostapd, dnsmasq, nmcli, iw, grep, sed, awk
+# Requisitos: bash, iproute2, nftables, hostapd, dnsmasq, nmcli, iw, grep, sed, awk
 
 set -euo pipefail
 
@@ -26,6 +26,8 @@ PROXY_PORT="${PROXY_PORT:-8080}"
 APPDIR="${APPDIR:-/tmp/roguebridge}"
 mkdir -p "$APPDIR/logs"
 
+NFT_TABLE="roguebridge"
+
 HOSTAPD_CONF="$APPDIR/hostapd.conf"
 HOSTAPD_PID="$APPDIR/hostapd.pid"
 
@@ -40,6 +42,8 @@ DNSMASQ_LOG="$APPDIR/logs/dnsmasq.log"
 usage() {
   cat <<USAGE
 Usage:
+  sudo $0                              – Modo interactivo (guiado)
+  sudo $0 [global options] interactive – Modo interactivo
   sudo $0 [global options] up
   sudo $0 [global options] down
   sudo $0 [global options] mitm on [port] [web|all]
@@ -90,9 +94,13 @@ check_cmd() {
 }
 
 ensure_deps() {
-  for c in ip iptables hostapd dnsmasq nmcli iw grep sed awk; do
+  for c in ip nft hostapd dnsmasq iw grep sed awk; do
     check_cmd "$c"
   done
+  # nmcli es opcional; sin él se omite la gestión de NetworkManager
+  if ! command -v nmcli >/dev/null 2>&1; then
+    log "nmcli no disponible; gestión de NetworkManager desactivada (ok)"
+  fi
 }
 
 get_default_route_iface() {
@@ -282,31 +290,55 @@ stop_dnsmasq() {
   fi
 }
 
-### ====== IPTABLES / NAT ====== ###
+### ====== NFTABLES / NAT ====== ###
+
+# Carga los módulos de kernel necesarios para nftables NAT/MASQUERADE/REDIRECT.
+# En Arch Linux son cargables (no built-in); sin ellos los rules fallan con
+# "No such file or directory".
+_nft_load_modules() {
+  local mods=(nf_nat nft_masq nft_chain_nat nft_redir)
+  for mod in "${mods[@]}"; do
+    modprobe "$mod" 2>/dev/null || true
+  done
+}
+
+# Reglas de forward sin MitM (llamada internamente)
+_nft_forward_base_rules() {
+  nft add rule ip "$NFT_TABLE" forward \
+    iif "$IFACE_WAN" oif "$IFACE_AP" ct state related,established accept
+  nft add rule ip "$NFT_TABLE" forward \
+    iif "$IFACE_AP" oif "$IFACE_WAN" accept
+  # TCPMSS clamp (equivalente a iptables -t mangle --clamp-mss-to-pmtu)
+  nft add rule ip "$NFT_TABLE" forward \
+    ip protocol tcp tcp flags '& (syn|rst) == syn' tcp option maxseg size set rt mtu
+}
+
 enable_nat() {
   log "Enabling IPv4 forwarding + NAT from $IFACE_AP to $IFACE_WAN"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  _nft_load_modules
 
-  iptables -t nat -D POSTROUTING -o "$IFACE_WAN" -j MASQUERADE 2>/dev/null || true
-  iptables -D FORWARD -i "$IFACE_WAN" -o "$IFACE_AP" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  iptables -D FORWARD -i "$IFACE_AP" -o "$IFACE_WAN" -j ACCEPT 2>/dev/null || true
+  # Tabla limpia
+  nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+  nft add table ip "$NFT_TABLE"
 
-  iptables -t nat -A POSTROUTING -o "$IFACE_WAN" -j MASQUERADE
-  iptables -A FORWARD -i "$IFACE_WAN" -o "$IFACE_AP" -m state --state RELATED,ESTABLISHED -j ACCEPT
-  iptables -A FORWARD -i "$IFACE_AP" -o "$IFACE_WAN" -j ACCEPT
+  # POSTROUTING – MASQUERADE
+  nft add chain ip "$NFT_TABLE" postrouting \
+    '{ type nat hook postrouting priority srcnat; policy accept; }'
+  nft add rule  ip "$NFT_TABLE" postrouting \
+    oif "$IFACE_WAN" masquerade
 
-  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  # FORWARD
+  nft add chain ip "$NFT_TABLE" forward \
+    '{ type filter hook forward priority filter; policy accept; }'
+  _nft_forward_base_rules
 
-  log "NAT + TCPMSS clamp enabled"
+  log "NFT NAT + TCPMSS clamp enabled"
 }
 
 disable_nat() {
   log "Disabling NAT rules for $IFACE_AP -> $IFACE_WAN"
-  iptables -t nat -D POSTROUTING -o "$IFACE_WAN" -j MASQUERADE 2>/dev/null || true
-  iptables -D FORWARD -i "$IFACE_WAN" -o "$IFACE_AP" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  iptables -D FORWARD -i "$IFACE_AP" -o "$IFACE_WAN" -j ACCEPT 2>/dev/null || true
-  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  nft delete table ip "$NFT_TABLE" 2>/dev/null || true
 }
 
 ### ====== MitM ====== ###
@@ -315,25 +347,52 @@ enable_mitm_rules() {
   local scope="$2"
 
   log "Enabling MitM redirection on $IFACE_AP to local port $port (scope: $scope)"
+  _nft_load_modules
 
-  disable_mitm_rules || true
+  # Asegurar que la tabla existe (mitm puede invocarse sin haber hecho 'up')
+  nft add table ip "$NFT_TABLE" 2>/dev/null || true
 
-  iptables -A FORWARD -i "$IFACE_AP" -p udp --dport 443 -j DROP
+  # PREROUTING para REDIRECT
+  nft add chain ip "$NFT_TABLE" prerouting \
+    '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+  nft flush chain ip "$NFT_TABLE" prerouting
 
+  # FORWARD: crear si no existe, luego añadir regla QUIC-drop
+  if ! nft list chain ip "$NFT_TABLE" forward >/dev/null 2>&1; then
+    nft add chain ip "$NFT_TABLE" forward \
+      '{ type filter hook forward priority filter; policy accept; }'
+    _nft_forward_base_rules
+  fi
+  # Bloquear QUIC (UDP 443) para forzar TLS sobre TCP
+  nft add rule ip "$NFT_TABLE" forward \
+    iif "$IFACE_AP" ip protocol udp udp dport 443 drop
+
+  # Reglas de redirección TCP
   if [ "$scope" = "web" ]; then
-    iptables -t nat -A PREROUTING -i "$IFACE_AP" -p tcp --dport 80  -j REDIRECT --to-ports "$port"
-    iptables -t nat -A PREROUTING -i "$IFACE_AP" -p tcp --dport 443 -j REDIRECT --to-ports "$port"
+    nft add rule ip "$NFT_TABLE" prerouting \
+      iif "$IFACE_AP" ip protocol tcp tcp dport 80  redirect to :"$port"
+    nft add rule ip "$NFT_TABLE" prerouting \
+      iif "$IFACE_AP" ip protocol tcp tcp dport 443 redirect to :"$port"
   else
-    iptables -t nat -A PREROUTING -i "$IFACE_AP" -p tcp -j REDIRECT --to-ports "$port"
+    nft add rule ip "$NFT_TABLE" prerouting \
+      iif "$IFACE_AP" ip protocol tcp redirect to :"$port"
   fi
 }
 
 disable_mitm_rules() {
   log "Disabling MitM redirection rules (if any)"
-  iptables -t nat -D PREROUTING -i "$IFACE_AP" -p tcp --dport 80  -j REDIRECT --to-ports "$PROXY_PORT" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -i "$IFACE_AP" -p tcp --dport 443 -j REDIRECT --to-ports "$PROXY_PORT" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -i "$IFACE_AP" -p tcp -j REDIRECT --to-ports "$PROXY_PORT" 2>/dev/null || true
-  iptables -D FORWARD -i "$IFACE_AP" -p udp --dport 443 -j DROP 2>/dev/null || true
+
+  # Eliminar cadena PREROUTING con sus REDIRECTs
+  nft flush  chain ip "$NFT_TABLE" prerouting 2>/dev/null || true
+  nft delete chain ip "$NFT_TABLE" prerouting 2>/dev/null || true
+
+  # Reconstruir FORWARD sin la regla QUIC-drop (si la tabla sigue activa)
+  if nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+    if nft list chain ip "$NFT_TABLE" forward >/dev/null 2>&1; then
+      nft flush chain ip "$NFT_TABLE" forward
+      _nft_forward_base_rules
+    fi
+  fi
 }
 
 ### ====== STATUS ====== ###
@@ -355,8 +414,8 @@ health_checks() {
     echo "no PID file"
   fi
   echo
-  echo "=== iptables NAT for $IFACE_AP -> $IFACE_WAN ==="
-  iptables -t nat -L POSTROUTING -n -v | grep -E "MASQUERADE" || true
+  echo "=== nftables ($NFT_TABLE) ==="
+  nft list table ip "$NFT_TABLE" 2>/dev/null || echo "(no rules / table not present)"
   echo
   echo "=== IPv4 forwarding ==="
   sysctl net.ipv4.ip_forward || true
@@ -365,6 +424,148 @@ health_checks() {
   echo "Main log: $LOG_FILE"
   echo "hostapd:  $HOSTAPD_LOG"
   echo "dnsmasq:  $DNSMASQ_LOG"
+}
+
+### ====== MODO INTERACTIVO ====== ###
+
+# Muestra lista numerada de interfaces del tipo dado y devuelve la elegida en REPLY.
+# Uso: _pick_iface wifi|wan <default>
+_pick_iface() {
+  local type="$1" default="$2"
+  local -a list=()
+  local d iface
+
+  for d in /sys/class/net/*/; do
+    iface="$(basename "$d")"
+    case "$type" in
+      wifi)
+        if [ -d "/sys/class/net/$iface/wireless" ]; then
+          list+=("$iface")
+        fi
+        ;;
+      wan)
+        [ "$iface" = "lo" ] && continue
+        [ -d "/sys/class/net/$iface/wireless" ] && continue
+        list+=("$iface")
+        ;;
+    esac
+  done
+
+  if [ "${#list[@]}" -eq 0 ]; then
+    echo "    (ninguna detectada automáticamente)"
+    _prompt "Introduce el nombre manualmente" "$default"
+    return
+  fi
+
+  # Índice del default para mostrarlo preseleccionado
+  local default_idx=1 i
+  for i in "${!list[@]}"; do
+    if [ "${list[$i]}" = "$default" ]; then
+      default_idx=$((i + 1))
+    fi
+  done
+
+  # Lista numerada
+  for i in "${!list[@]}"; do
+    printf '    %d) %s\n' "$((i + 1))" "${list[$i]}"
+  done
+
+  # Lectura de la selección
+  local val
+  read -rp "  Selecciona [${default_idx}]: " val </dev/tty
+  val="${val:-$default_idx}"
+
+  # Resolver número → nombre; si escriben el nombre directamente, se acepta
+  if [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le "${#list[@]}" ]; then
+    REPLY="${list[$((val - 1))]}"
+  else
+    REPLY="$val"
+  fi
+}
+
+# Lee un valor del terminal; deja REPLY con el resultado (o el default)
+_prompt() {
+  local prompt="$1" default="$2" val
+  read -rp "  $prompt [${default}]: " val </dev/tty
+  REPLY="${val:-$default}"
+}
+
+# Igual que _prompt pero oculta la entrada (para contraseñas)
+_prompt_secret() {
+  local prompt="$1" default="$2" val
+  read -rsp "  $prompt [${default:+****}]: " val </dev/tty
+  printf '\n' >/dev/tty
+  REPLY="${val:-$default}"
+}
+
+do_interactive() {
+  check_root
+  ensure_deps
+
+  printf '\n'
+  echo "╔══════════════════════════════════════════╗"
+  echo "║     RogueBridge – Configuración guiada   ║"
+  echo "╚══════════════════════════════════════════╝"
+  printf '\n'
+
+  # ── Interfaces ──────────────────────────────────
+  echo "── Interfaces ───────────────────────────────"
+  echo "  Interfaz AP (WiFi):"
+  _pick_iface wifi "$IFACE_AP"
+  IFACE_AP="$REPLY"
+
+  printf '\n'
+  echo "  Interfaz WAN (salida a Internet):"
+  _pick_iface wan "$IFACE_WAN"
+  IFACE_WAN="$REPLY"
+  printf '\n'
+
+  # ── AP ───────────────────────────────────────────
+  echo "── Configuración del AP ─────────────────────"
+  _prompt        "SSID"                     "$SSID";           SSID="$REPLY"
+  _prompt_secret "Contraseña WPA2 (≥8 ch)"  "$WPA_PASSPHRASE"; WPA_PASSPHRASE="$REPLY"
+  _prompt        "IP del AP"                "$AP_IP";          AP_IP="$REPLY"
+  _prompt        "Canal WiFi (1-13)"        "$CHANNEL";        CHANNEL="$REPLY"
+  _prompt        "Código de país (US/ES/…)" "$COUNTRY";        COUNTRY="$REPLY"
+  printf '\n'
+
+  # ── DHCP (opcional) ──────────────────────────────
+  echo "── DHCP (Enter para conservar defaults) ─────"
+  _prompt "DHCP inicio" "$DHCP_START"; DHCP_START="$REPLY"
+  _prompt "DHCP fin"    "$DHCP_END";   DHCP_END="$REPLY"
+  printf '\n'
+
+  # ── Acción ───────────────────────────────────────
+  echo "── Acción ───────────────────────────────────"
+  echo "  1) up        – Levantar el AP"
+  echo "  2) down      – Bajar el AP"
+  echo "  3) mitm on   – Activar redirección MitM"
+  echo "  4) mitm off  – Desactivar MitM"
+  echo "  5) status    – Ver estado actual"
+  printf '\n'
+  _prompt "Selecciona acción" "1"
+  local choice="$REPLY"
+
+  case "$choice" in
+    1) do_up ;;
+    2) do_down ;;
+    3)
+      printf '\n'
+      echo "── MitM ─────────────────────────────────────"
+      _prompt "Puerto proxy local" "$PROXY_PORT"
+      PROXY_PORT="$REPLY"
+      _prompt "Scope  (web = 80/443 · all = todo TCP)" "$MITM_SCOPE"
+      local scope="$REPLY"
+      case "$scope" in
+        web|all) ;;
+        *) die "Scope inválido: $scope (usa web o all)" ;;
+      esac
+      do_mitm_on "$PROXY_PORT" "$scope"
+      ;;
+    4) do_mitm_off ;;
+    5) health_checks ;;
+    *) die "Opción inválida: $choice" ;;
+  esac
 }
 
 ### ====== ACCIONES PRINCIPALES ====== ###
@@ -446,7 +647,7 @@ while [ $# -gt 0 ]; do
       DNSMASQ_LOG="$APPDIR/logs/dnsmasq.log"
       shift
       ;;
-    up|down|status)
+    up|down|status|interactive|i)
       ACTION="$1"; shift ;;
     mitm)
       ACTION="mitm"; shift
@@ -462,14 +663,14 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "${ACTION:-}" ]; then
-  usage
-  exit 1
+  ACTION="interactive"
 fi
 
 case "$ACTION" in
-  up)     do_up ;;
-  down)   do_down ;;
-  status) health_checks ;;
+  up)                do_up ;;
+  down)              do_down ;;
+  status)            health_checks ;;
+  interactive|i)     do_interactive ;;
   mitm)
     case "${ACTION_ARGS[0]:-}" in
       on)  do_mitm_on "${ACTION_ARGS[1]:-}" "${ACTION_ARGS[2]:-}" ;;
