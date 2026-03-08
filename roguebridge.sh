@@ -37,6 +37,34 @@ DNSMASQ_PID="${DNSMASQ_PID:-/run/dnsmasq_roguebridge.pid}"
 LOG_FILE="$APPDIR/logs/roguebridge.log"
 HOSTAPD_LOG="$APPDIR/logs/hostapd.log"
 DNSMASQ_LOG="$APPDIR/logs/dnsmasq.log"
+STATE_FILE="$APPDIR/state"
+
+### ====== STATE ====== ###
+# Persiste las interfaces activas para que 'down'/'mitm off' las conozcan
+# aunque se invoquen sin pasar --iface-* de nuevo.
+_save_state() {
+  cat > "$STATE_FILE" <<EOF
+IFACE_AP=$IFACE_AP
+IFACE_WAN=$IFACE_WAN
+PROXY_PORT=$PROXY_PORT
+EOF
+}
+
+# Carga el estado guardado; las variables de entorno y CLI lo sobreescriben después.
+_load_state() {
+  [ -f "$STATE_FILE" ] || return 0
+  local key val line
+  while IFS='=' read -r key val; do
+    case "$key" in
+      IFACE_AP)    IFACE_AP="$val"    ;;
+      IFACE_WAN)   IFACE_WAN="$val"   ;;
+      PROXY_PORT)  PROXY_PORT="$val"  ;;
+    esac
+  done < "$STATE_FILE"
+}
+
+# Cargar estado previo antes de parsear args (los args pueden sobreescribir)
+_load_state
 
 ### ====== HELPERS ====== ###
 usage() {
@@ -302,12 +330,14 @@ _nft_load_modules() {
   done
 }
 
-# Reglas de forward sin MitM (llamada internamente)
+# Reglas de forward sin MitM (llamada internamente).
+# Usa iifname/oifname (string late-binding) en lugar de iif/oif (índice
+# resuelto al insertar), para no fallar si la interfaz no existe aún.
 _nft_forward_base_rules() {
   nft add rule ip "$NFT_TABLE" forward \
-    iif "$IFACE_WAN" oif "$IFACE_AP" ct state related,established accept
+    iifname "$IFACE_WAN" oifname "$IFACE_AP" ct state related,established accept
   nft add rule ip "$NFT_TABLE" forward \
-    iif "$IFACE_AP" oif "$IFACE_WAN" accept
+    iifname "$IFACE_AP" oifname "$IFACE_WAN" accept
   # TCPMSS clamp (equivalente a iptables -t mangle --clamp-mss-to-pmtu)
   nft add rule ip "$NFT_TABLE" forward \
     ip protocol tcp tcp flags '& (syn|rst) == syn' tcp option maxseg size set rt mtu
@@ -326,13 +356,14 @@ enable_nat() {
   nft add chain ip "$NFT_TABLE" postrouting \
     '{ type nat hook postrouting priority srcnat; policy accept; }'
   nft add rule  ip "$NFT_TABLE" postrouting \
-    oif "$IFACE_WAN" masquerade
+    oifname "$IFACE_WAN" masquerade
 
   # FORWARD
   nft add chain ip "$NFT_TABLE" forward \
     '{ type filter hook forward priority filter; policy accept; }'
   _nft_forward_base_rules
 
+  _save_state
   log "NFT NAT + TCPMSS clamp enabled"
 }
 
@@ -363,19 +394,20 @@ enable_mitm_rules() {
       '{ type filter hook forward priority filter; policy accept; }'
     _nft_forward_base_rules
   fi
+  _save_state
   # Bloquear QUIC (UDP 443) para forzar TLS sobre TCP
   nft add rule ip "$NFT_TABLE" forward \
-    iif "$IFACE_AP" ip protocol udp udp dport 443 drop
+    iifname "$IFACE_AP" ip protocol udp udp dport 443 drop
 
   # Reglas de redirección TCP
   if [ "$scope" = "web" ]; then
     nft add rule ip "$NFT_TABLE" prerouting \
-      iif "$IFACE_AP" ip protocol tcp tcp dport 80  redirect to :"$port"
+      iifname "$IFACE_AP" ip protocol tcp tcp dport 80  redirect to :"$port"
     nft add rule ip "$NFT_TABLE" prerouting \
-      iif "$IFACE_AP" ip protocol tcp tcp dport 443 redirect to :"$port"
+      iifname "$IFACE_AP" ip protocol tcp tcp dport 443 redirect to :"$port"
   else
     nft add rule ip "$NFT_TABLE" prerouting \
-      iif "$IFACE_AP" ip protocol tcp redirect to :"$port"
+      iifname "$IFACE_AP" ip protocol tcp redirect to :"$port"
   fi
 }
 
